@@ -678,6 +678,59 @@ def get_batch(batch_id: str) -> Optional[dict]:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# GET /batches/{batch_id}/drift：批次漂移审计（只读）
+# ---------------------------------------------------------------------------
+
+
+def audit_batch_drift(batch_id: str) -> Optional[dict]:
+    """以批次不可变结果快照中的原始会话树为基线，审计 threads 节点的当前漂移。
+
+    未知批次返回 None（-> 404）。基线直接取自 ``batch_results`` 快照的
+    ``threads``（归档后永不改写），只读取当前 ``messages`` 表比对：不写库、
+    不改写快照与诊断明细。逐封结果按快照原始先序输出
+    original/current 的 parent 与 root，并按状态汇总计数。
+    """
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT result_json FROM batch_results WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot = json.loads(row["result_json"])
+        original_nodes = threading.flatten_forest_preorder(snapshot["threads"])
+
+        # 当前全量消息：id -> (来源批次, 当前父指针, 是否环内 invalid)。
+        # 需要全量父指针图才能为各节点沿父链上溯当前根。
+        current_rows = {
+            r["message_id"]: (r["batch_id"], r["parent_id"], bool(r["is_invalid"]))
+            for r in conn.execute(
+                "SELECT message_id, parent_id, is_invalid, batch_id FROM messages"
+            )
+        }
+
+        audit = threading.audit_batch_drift(batch_id, original_nodes, current_rows)
+        return {
+            "batch_id": batch_id,
+            "results": [
+                {
+                    "message_id": item.message_id,
+                    "original_parent_id": item.original_parent_id,
+                    "current_parent_id": item.current_parent_id,
+                    "original_root_id": item.original_root_id,
+                    "current_root_id": item.current_root_id,
+                    "status": item.status,
+                }
+                for item in audit.items
+            ],
+            "summary": audit.summary,
+        }
+    finally:
+        conn.close()
+
+
 def get_message(message_id: str) -> Optional[dict]:
     conn = database.connect()
     try:

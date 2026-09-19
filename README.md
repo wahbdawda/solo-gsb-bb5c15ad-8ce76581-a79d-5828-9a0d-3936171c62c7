@@ -14,7 +14,10 @@
 （`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）、
 **会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
 响应是否落在时限内），以及**会话主题漂移审计**（`POST /thread-subject-audit`，
-只读地按分支基线逐节点判定主题漂移并归并连续偏离分组）。
+只读地按分支基线逐节点判定主题漂移并归并连续偏离分组），以及
+**批次漂移审计**（`GET /batches/{batch_id}/drift`，以批次不可变结果快照中的
+原始会话树为基线，只读地逐封比对当前拓扑：deleted / id_reused /
+reparented / root_changed / unchanged）。
 
 ## 一条命令启动
 
@@ -59,6 +62,7 @@ ports:
 | `POST` | `/imports/rfc5322` | **导入一组 RFC 5322 原始邮件头**：解析折行、重复字段与 RFC 2047 编码词，归一为批次模型后一次性归档（HTTP 201） |
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
+| `GET` | `/batches/{batch_id}/drift` | **批次漂移审计**：以该批次不可变结果快照的原始会话树为基线，只读逐封比对当前拓扑（未知批次 **404**） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
 | `POST` | `/thread-corrections` | **人工会话纠偏**：调整一封有效邮件的父节点（`null` 拆成根），带 revision 乐观校验（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
@@ -75,7 +79,8 @@ ports:
 `retain_until` 早于或等于清理 `cutoff` 即视为到期。环内 `invalid` 邮件
 不参与冻结与清理。
 
-未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+未知 ID：批次 / 批次漂移审计 / 邮件查询、`/relinks` 返回 **404**；请求体不合法
+返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /batches` 的 `Idempotency-Key` 格式非法（空值 / 含空白 / 非可见 ASCII /
@@ -584,6 +589,68 @@ curl -X POST http://localhost:8000/thread-subject-audit \
 }
 ```
 
+### 批次漂移审计：`GET /batches/{batch_id}/drift`
+
+批次结果快照**归档后永不改写**，而此后的补链（`POST /relinks`）、人工纠偏
+（`POST /thread-corrections`）、保留期清理压缩、以及同 ID 邮件的重新归档，
+都会让 `messages` 表中的**当前拓扑**偏离快照。本接口以该批次不可变结果快照中
+的**原始会话树**为基线做漂移审计，用于发现“快照里的那些邮件后来怎么了”。
+
+接口**只读**：只读取批次快照与当前 `messages` 表，不写库、不改写快照与诊断
+明细。审计范围**仅限快照 `threads` 节点**（引用环内 `invalid` 邮件从不出现在
+`threads` 中，因此不参与审计），结果按快照的**原始先序**逐封输出每封邮件的
+original/current 父节点与根，并给出各状态计数。
+
+状态按以下优先级**依次**判定（命中即止）：
+
+1. **`deleted`**：当前 `messages` 中已不存在同 ID（典型为保留期清理删除）；
+2. **`id_reused`**：同 ID 当前存在，但**属于另一个 batch**（典型为清理删除后
+   同 ID 在新批次重新归档）；该判定优先于一切父/根比较；
+3. **`reparented`**：来源批次一致，但**当前父节点与原始父节点不同**（补链、
+   纠偏移动、清理时中间祖先被删导致的重挂都算）；
+4. **`root_changed`**：父节点未变，但**所在会话的根已变化**（典型为祖先链上
+   的根被清理删除、本节点被压缩提升，父指针恰好不变）；
+5. **`unchanged`**：父节点与根均与快照一致。
+
+未知批次返回 **404**。`deleted` 节点的 `current_parent_id` /
+`current_root_id` 为 `null`；重新归档后的同 ID 若落入引用环（当前为
+`invalid`），这两个 current 字段同样为 `null`（原始字段仍取自快照）。
+
+服务监听 **8000** 端口：
+
+```bash
+curl http://localhost:8000/batches/$BATCH_ID/drift
+```
+
+```jsonc
+{
+  "batch_id": "…",
+  "results": [                          // 仅快照 threads 节点，按原始先序
+    {"message_id": "R",
+     "original_parent_id": null, "current_parent_id": null,
+     "original_root_id": "R", "current_root_id": null,
+     "status": "deleted"},             // R 已被保留期清理删除
+    {"message_id": "C",
+     "original_parent_id": "A", "current_parent_id": null,
+     "original_root_id": "R", "current_root_id": "C",
+     "status": "reparented"},          // 越过被删的 A 压缩提升为新根
+    {"message_id": "E",
+     "original_parent_id": "C", "current_parent_id": "C",
+     "original_root_id": "R", "current_root_id": "C",
+     "status": "root_changed"}         // 父未变，仅根 R -> C
+  ],
+  "summary": {"total": 3, "deleted": 1, "id_reused": 0,
+              "reparented": 1, "root_changed": 1, "unchanged": 0}
+}
+```
+
+人工纠偏把 `C`（连同子树 `D`）从 `A` 树下拆成新根后：`C` 为 `reparented`
+（父 `A` → `null`），而 `D` 的父仍是 `C`、仅根由 `A` 变为 `C`，因此
+`D` 为 `root_changed`。清理删除 `R`/`A` 后用**相同 message_id** 重新归档
+（新批次），再以旧批次为基线审计时，这些同 ID 节点为 `id_reused`（不再是
+`deleted`），其 current 父/根反映新批次下的拓扑；以新批次自己的快照审计时
+它们仍为 `unchanged`。
+
 ## 保留期：冻结与到期清理
 
 归档时可给邮件设置可选的 `retain_until`（保留截止时间）：
@@ -747,6 +814,7 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
 - `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、人工
   纠偏、保留期清理只更新/删除 `messages`，快照与诊断表永不改写）；
+  `GET /batches/{id}/drift` 的漂移审计即以该快照的原始 `threads` 为只读基线；
 - `idempotency_keys`：`POST /batches` 幂等登记（键为主键，存请求体摘要与对应
   `batch_id`）；与批次结果在同一写事务内登记，保证并发下只归档一次；
 - `retention_freezes`：冻结锚点（活跃冻结不存成员快照；保护集合在使用时按当前

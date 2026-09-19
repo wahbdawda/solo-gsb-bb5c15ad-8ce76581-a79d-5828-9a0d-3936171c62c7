@@ -727,3 +727,161 @@ def audit_thread_subjects(
     flush_group()
 
     return ThreadSubjectAudit(items=items, drift_groups=drift_groups)
+
+
+# ---------------------------------------------------------------------------
+# 批次漂移审计：以批次不可变结果快照中的原始会话树为基线，只读比对当前拓扑
+# ---------------------------------------------------------------------------
+
+# 逐节点漂移状态（判定优先级自上而下）。
+DRIFT_DELETED = "deleted"          # 同 ID 当前已不存在（如已被保留期清理删除）
+DRIFT_ID_REUSED = "id_reused"      # 同 ID 当前存在，但属于另一个批次（清理后同 ID 重归档）
+DRIFT_REPARENTED = "reparented"    # 来源批次一致，但当前父节点与原始父节点不同
+DRIFT_ROOT_CHANGED = "root_changed"  # 父节点未变，但所在会话的根已变化
+DRIFT_UNCHANGED = "unchanged"      # 父节点与根均与快照一致
+
+
+@dataclass(frozen=True)
+class BatchDriftItem:
+    """快照 threads 中一个原始节点相对当前拓扑的漂移判定。"""
+
+    message_id: str
+    original_parent_id: Optional[str]
+    current_parent_id: Optional[str]
+    original_root_id: str
+    current_root_id: Optional[str]
+    status: str
+
+
+@dataclass(frozen=True)
+class BatchDriftAudit:
+    """一次批次漂移审计的完整结论（items 按快照原始先序排列）。"""
+
+    items: list[BatchDriftItem]
+    summary: dict[str, int]
+
+
+def flatten_forest_preorder(
+    threads: list[dict],
+) -> list[tuple[str, Optional[str]]]:
+    """把快照中嵌套的会话树按**原始先序**展开为 (message_id, parent_id) 序列。
+
+    快照 threads 由 build_forest 以 (sent_at, message_id) 稳定排序生成，
+    嵌套 children 的次序即先序；此处仅做保持次序的扁平化，不重新排序，
+    审计因此严格按归档时的原始先序逐封输出。
+    """
+
+    out: list[tuple[str, Optional[str]]] = []
+
+    def walk(node: dict) -> None:
+        out.append((node["message_id"], node.get("parent_id")))
+        for child in node.get("children", []):
+            walk(child)
+
+    for root in threads:
+        walk(root)
+    return out
+
+
+def _climb_in_parent_map(
+    start: str, parent_of: dict[str, Optional[str]]
+) -> str:
+    """在内存父指针图上向上爬到根（遇环或穿出时回退为当前节点）。"""
+
+    cur = start
+    seen: set[str] = set()
+    while True:
+        pid = parent_of.get(cur)
+        if pid is None or pid in seen:
+            return cur
+        seen.add(cur)
+        cur = pid
+
+
+def audit_batch_drift(
+    batch_id: str,
+    original_nodes: list[tuple[str, Optional[str]]],
+    current_rows: dict[str, tuple[str, Optional[str], bool]],
+) -> BatchDriftAudit:
+    """以批次快照中的原始会话树为基线，逐节点比对当前拓扑（纯函数）。
+
+    Args:
+        batch_id: 被审计批次的 ID（基线来源）。
+        original_nodes: 快照 threads 按原始先序展开的
+            (message_id, original_parent_id) 序列；仅审计这些节点。
+        current_rows: 当前 messages 表中 message_id ->
+            (batch_id, parent_id, is_invalid) 的映射。
+
+    状态按以下优先级**依次**判定（命中即止）：
+
+    1. ``deleted``：当前 messages 中不存在同 ID；
+    2. ``id_reused``：同 ID 当前存在，但 ``batch_id`` 不是被审计批次
+       （典型为清理删除后同 ID 在新批次重新归档）；
+    3. ``reparented``：来源批次一致，但当前父节点与原始父节点不同；
+    4. ``root_changed``：父节点未变，但当前所在会话的根与原始根不同；
+    5. ``unchanged``：其余情况。
+
+    环内 invalid 邮件从不出现在快照 threads 中；重归档后的同 ID 若落入
+    引用环（invalid），其 current_parent_id/current_root_id 输出 None。
+    """
+
+    original_parent_of: dict[str, Optional[str]] = {
+        mid: pid for mid, pid in original_nodes
+    }
+    current_parent_of: dict[str, Optional[str]] = {
+        mid: row[1] for mid, row in current_rows.items()
+    }
+
+    counts = {
+        DRIFT_DELETED: 0,
+        DRIFT_ID_REUSED: 0,
+        DRIFT_REPARENTED: 0,
+        DRIFT_ROOT_CHANGED: 0,
+        DRIFT_UNCHANGED: 0,
+    }
+    items: list[BatchDriftItem] = []
+
+    for mid, original_pid in original_nodes:
+        original_root = _climb_in_parent_map(mid, original_parent_of)
+
+        row = current_rows.get(mid)
+        if row is None:
+            # 1) 当前不存在 -> deleted
+            status = DRIFT_DELETED
+            current_pid: Optional[str] = None
+            current_root: Optional[str] = None
+        else:
+            current_batch, row_parent_id, is_invalid = row
+            if is_invalid:
+                # 环内 invalid 邮件不挂接任何会话树
+                current_pid = None
+                current_root = None
+            else:
+                current_pid = row_parent_id
+                current_root = _climb_in_parent_map(mid, current_parent_of)
+
+            if current_batch != batch_id:
+                # 2) 同 ID 当前属于其他批次 -> id_reused
+                status = DRIFT_ID_REUSED
+            elif current_pid != original_pid:
+                # 3) 来源一致但父节点变化（补链、纠偏、清理压缩）-> reparented
+                status = DRIFT_REPARENTED
+            elif current_root != original_root:
+                # 4) 仅根变化（祖先链上的根被删而本节点父指针未变）-> root_changed
+                status = DRIFT_ROOT_CHANGED
+            else:
+                # 5) 父与根均未变 -> unchanged
+                status = DRIFT_UNCHANGED
+
+        counts[status] += 1
+        items.append(BatchDriftItem(
+            message_id=mid,
+            original_parent_id=original_pid,
+            current_parent_id=current_pid,
+            original_root_id=original_root,
+            current_root_id=current_root,
+            status=status,
+        ))
+
+    summary = {"total": len(items), **counts}
+    return BatchDriftAudit(items=items, summary=summary)
