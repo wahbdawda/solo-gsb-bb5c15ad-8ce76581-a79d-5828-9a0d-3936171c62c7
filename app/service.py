@@ -678,6 +678,78 @@ def get_batch(batch_id: str) -> Optional[dict]:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# GET /batches/{batch_id}/drift：批次漂移审计（只读）
+# ---------------------------------------------------------------------------
+
+
+def audit_batch_drift(batch_id: str) -> Optional[dict]:
+    """只读审计某批次不可变快照中原始会话树的漂移。
+
+    以快照 threads 森林为基线（原始先序），逐节点对照当前 messages 表。
+    当前行 archived_at 不晚于批次 submitted_at 即仍是快照时的同一归档
+    （来源一致；历史祖先由其原始批次归档、同样一致）；晚于批次
+    submitted_at 说明原归档已被删除、同 ID 由更晚的批次重新归档
+    （id_reused）。未知批次返回 None（-> 404）。不写库、不改写批次快照
+    与诊断明细。
+    """
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT result_json FROM batch_results WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot = json.loads(row["result_json"])
+        submitted_at = snapshot["submitted_at"]
+
+        baseline = threading.flatten_snapshot_threads(snapshot["threads"])
+        baseline_ids = [node.message_id for node in baseline]
+
+        # 当前整幅父指针图：一次装载后在内存中上溯各节点的当前根
+        parent_map: dict[str, Optional[str]] = {
+            r["message_id"]: r["parent_id"]
+            for r in conn.execute("SELECT message_id, parent_id FROM messages")
+        }
+        current: dict[str, threading.DriftCurrentState] = {}
+        if baseline_ids:
+            placeholders = ",".join("?" * len(baseline_ids))
+            rows = conn.execute(
+                "SELECT message_id, parent_id, archived_at FROM messages "
+                f"WHERE message_id IN ({placeholders})",
+                baseline_ids,
+            ).fetchall()
+            for r in rows:
+                mid = r["message_id"]
+                current[mid] = threading.DriftCurrentState(
+                    parent_id=r["parent_id"],
+                    root_id=_climb_root_inmem(mid, parent_map),
+                    # 归档时间不晚于快照时刻 => 仍是快照时的同一行（同一归档）
+                    source_consistent=r["archived_at"] <= submitted_at,
+                )
+
+        audit = threading.audit_batch_drift(baseline, current)
+        return {
+            "batch_id": batch_id,
+            "submitted_at": submitted_at,
+            "results": [
+                {
+                    "message_id": item.message_id,
+                    "original_parent_id": item.original_parent_id,
+                    "original_root_id": item.original_root_id,
+                    "current_parent_id": item.current_parent_id,
+                    "current_root_id": item.current_root_id,
+                    "status": item.status,
+                }
+                for item in audit.items
+            ],
+            "summary": audit.summary,
+        }
+    finally:
+        conn.close()
+
+
 def get_message(message_id: str) -> Optional[dict]:
     conn = database.connect()
     try:

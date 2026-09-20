@@ -487,4 +487,54 @@ class ThreadSubjectAuditReport(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# 批次漂移审计
+# ---------------------------------------------------------------------------
+
+
+class BatchDriftItem(BaseModel):
+    """批次快照 threads 森林中一个节点的漂移判定。"""
+
+    message_id: str
+    original_parent_id: Optional[str] = Field(
+        ..., description="快照中该节点的父节点（根节点为 null）"
+    )
+    original_root_id: str = Field(..., description="快照中该节点所在树的根")
+    current_parent_id: Optional[str] = Field(
+        ..., description="当前父节点；已删除（deleted）为 null"
+    )
+    current_root_id: Optional[str] = Field(
+        ..., description="当前所在树的根；已删除（deleted）为 null"
+    )
+    status: Literal[
+        "deleted", "id_reused", "reparented", "root_changed", "unchanged"
+    ] = Field(
+        ...,
+        description=(
+            "deleted=当前不存在；id_reused=同 ID 当前属于其它批次（原归档被清理后重归档）；"
+            "reparented=来源一致但父节点变化；root_changed=仅根节点变化；unchanged=未漂移"
+        ),
+    )
+
+
+class BatchDriftSummary(BaseModel):
+    total: int
+    deleted: int
+    id_reused: int
+    reparented: int
+    root_changed: int
+    unchanged: int
+
+
+class BatchDriftReport(BaseModel):
+    """GET /batches/{batch_id}/drift：批次快照会话树的漂移审计结论。"""
+
+    batch_id: str
+    submitted_at: datetime = Field(..., description="批次归档时间（快照基线时刻），UTC")
+    results: list[BatchDriftItem] = Field(
+        ..., description="逐节点判定结果，按快照原始先序排列"
+    )
+    summary: BatchDriftSummary = Field(..., description="按状态分类的计数汇总")
+
+
 TreeNode.model_rebuild()

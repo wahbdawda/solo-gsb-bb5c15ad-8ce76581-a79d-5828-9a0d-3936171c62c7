@@ -727,3 +727,129 @@ def audit_thread_subjects(
     flush_group()
 
     return ThreadSubjectAudit(items=items, drift_groups=drift_groups)
+
+
+# ---------------------------------------------------------------------------
+# 批次漂移审计：以批次快照会话树为基线对照当前归档状态（纯逻辑，只读）
+# ---------------------------------------------------------------------------
+
+# 逐节点判定的五种结论（判定优先级即下列顺序）。
+DRIFT_DELETED = "deleted"            # 当前已不存在（如保留期清理删除）
+DRIFT_ID_REUSED = "id_reused"        # 同 ID 当前属于其它批次（原归档被清理后重归档）
+DRIFT_REPARENTED = "reparented"      # 来源一致但父节点变化
+DRIFT_ROOT_CHANGED = "root_changed"  # 父节点未变、仅根节点变化
+DRIFT_UNCHANGED = "unchanged"        # 父节点与根节点均与快照一致
+
+
+@dataclass(frozen=True)
+class DriftBaselineNode:
+    """批次快照 threads 森林中的一个节点（按原始先序展开）。"""
+
+    message_id: str
+    parent_id: Optional[str]
+    root_id: str
+
+
+@dataclass(frozen=True)
+class DriftCurrentState:
+    """某 message_id 的当前归档状态（仅当前仍存在的邮件参与）。
+
+    source_consistent 为 False 表示当前行不是快照基线时的同一归档——
+    原归档被删除后，同 ID 由更晚的批次重新归档（id_reused）。
+    """
+
+    parent_id: Optional[str]
+    root_id: str
+    source_consistent: bool
+
+
+@dataclass(frozen=True)
+class DriftItem:
+    """一个基线节点的漂移判定。"""
+
+    message_id: str
+    original_parent_id: Optional[str]
+    original_root_id: str
+    current_parent_id: Optional[str]
+    current_root_id: Optional[str]
+    status: str
+
+
+@dataclass(frozen=True)
+class BatchDriftAudit:
+    """整份批次快照 threads 森林的漂移审计结论（items 按原始先序排列）。"""
+
+    items: list[DriftItem]
+    summary: dict[str, int]
+
+
+def flatten_snapshot_threads(threads: list[dict]) -> list[DriftBaselineNode]:
+    """把批次快照中的 threads 森林按原始先序展开。
+
+    快照在归档时已按 (sent_at, message_id) 稳定排序，这里严格按嵌套顺序
+    先序展开、不再重排；每个节点记录其快照中的父节点与所在树的根。
+    """
+
+    out: list[DriftBaselineNode] = []
+
+    def walk(node: dict, root_id: str) -> None:
+        out.append(DriftBaselineNode(
+            message_id=node["message_id"],
+            parent_id=node["parent_id"],
+            root_id=root_id,
+        ))
+        for child in node["children"]:
+            walk(child, root_id)
+
+    for tree in threads:
+        walk(tree, tree["message_id"])
+    return out
+
+
+def audit_batch_drift(
+    baseline: list[DriftBaselineNode],
+    current: dict[str, DriftCurrentState],
+) -> BatchDriftAudit:
+    """对快照基线逐节点判定漂移状态（纯函数，不改动任何输入）。
+
+    按原始先序逐节点依次判定：
+        1. 当前不存在 -> deleted（current_parent_id / current_root_id 为 None）；
+        2. 当前行不是快照时的同一归档（同 ID 现属其它批次）-> id_reused；
+        3. 来源一致但父节点变化 -> reparented；
+        4. 父节点未变、仅根节点变化 -> root_changed；
+        5. 否则 -> unchanged。
+    """
+
+    items: list[DriftItem] = []
+    counts = {
+        DRIFT_DELETED: 0,
+        DRIFT_ID_REUSED: 0,
+        DRIFT_REPARENTED: 0,
+        DRIFT_ROOT_CHANGED: 0,
+        DRIFT_UNCHANGED: 0,
+    }
+    for node in baseline:
+        cur = current.get(node.message_id)
+        if cur is None:
+            status, cur_parent, cur_root = DRIFT_DELETED, None, None
+        else:
+            cur_parent, cur_root = cur.parent_id, cur.root_id
+            if not cur.source_consistent:
+                status = DRIFT_ID_REUSED
+            elif cur_parent != node.parent_id:
+                status = DRIFT_REPARENTED
+            elif cur_root != node.root_id:
+                status = DRIFT_ROOT_CHANGED
+            else:
+                status = DRIFT_UNCHANGED
+        counts[status] += 1
+        items.append(DriftItem(
+            message_id=node.message_id,
+            original_parent_id=node.parent_id,
+            original_root_id=node.root_id,
+            current_parent_id=cur_parent,
+            current_root_id=cur_root,
+            status=status,
+        ))
+
+    return BatchDriftAudit(items=items, summary={"total": len(items), **counts})

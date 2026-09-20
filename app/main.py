@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from . import database, service
 from .config import settings
 from .schemas import (
+    BatchDriftReport,
     BatchIn,
     BatchResult,
     BatchSummary,
@@ -41,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
         "POST /batches 支持 Idempotency-Key 幂等提交（同键同内容重放首次批次响应，"
@@ -49,8 +50,9 @@ app = FastAPI(
         "支持 RFC 5322 原始邮件头导入（POST /imports/rfc5322，解析折行、重复字段与 "
         "RFC 2047 编码词）、邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
         "人工会话纠偏（POST /thread-corrections），"
-        "会话响应时限评估（POST /thread-sla/evaluate，只读），"
-        "以及会话主题漂移审计（POST /thread-subject-audit，只读）。"
+        "会话响应时限评估（POST /thread-sla/evaluate，只读）、"
+        "会话主题漂移审计（POST /thread-subject-audit，只读），"
+        "以及批次漂移审计（GET /batches/{batch_id}/drift，只读）。"
     ),
     lifespan=lifespan,
 )
@@ -143,6 +145,19 @@ def list_batches(
 )
 def get_batch(batch_id: str) -> dict:
     result = service.get_batch(batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return result
+
+
+@app.get(
+    "/batches/{batch_id}/drift",
+    response_model=BatchDriftReport,
+    tags=["batches"],
+    summary="批次漂移审计：以该批次快照的原始会话树为基线，只读逐封判定漂移状态",
+)
+def audit_batch_drift(batch_id: str) -> dict:
+    result = service.audit_batch_drift(batch_id)
     if result is None:
         raise HTTPException(status_code=404, detail="batch not found")
     return result

@@ -15,6 +15,9 @@
 **会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
 响应是否落在时限内），以及**会话主题漂移审计**（`POST /thread-subject-audit`，
 只读地按分支基线逐节点判定主题漂移并归并连续偏离分组）。
+另有**批次漂移审计**（`GET /batches/{batch_id}/drift`）：以批次不可变快照中的
+原始会话树为基线，只读地逐封判定 `deleted` / `id_reused` / `reparented` /
+`root_changed` / `unchanged` 并返回各状态计数。
 
 ## 一条命令启动
 
@@ -59,6 +62,7 @@ ports:
 | `POST` | `/imports/rfc5322` | **导入一组 RFC 5322 原始邮件头**：解析折行、重复字段与 RFC 2047 编码词，归一为批次模型后一次性归档（HTTP 201） |
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
+| `GET` | `/batches/{batch_id}/drift` | **批次漂移审计**：以该批次快照的原始会话树为基线，只读逐封判定 `deleted` / `id_reused` / `reparented` / `root_changed` / `unchanged` 并返回各状态计数 |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
 | `POST` | `/thread-corrections` | **人工会话纠偏**：调整一封有效邮件的父节点（`null` 拆成根），带 revision 乐观校验（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
@@ -75,7 +79,7 @@ ports:
 `retain_until` 早于或等于清理 `cutoff` 即视为到期。环内 `invalid` 邮件
 不参与冻结与清理。
 
-未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+未知 ID：批次查询与批次漂移审计、邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /batches` 的 `Idempotency-Key` 格式非法（空值 / 含空白 / 非可见 ASCII /
@@ -581,6 +585,50 @@ curl -X POST http://localhost:8000/thread-subject-audit \
   "drift_groups": [                     // 先序连续偏离节点合并成组
     {"members": ["C"], "baseline_subject": "项目周报"}
   ]
+}
+```
+
+### 批次漂移审计：`GET /batches/{batch_id}/drift`
+
+以**该批次不可变结果快照中的原始会话树**（`threads`）为基线，只读审计这些节点
+当前的归档状态。接口**只读**：不写库、不改写批次快照与诊断明细；未知批次返回
+**404**。
+
+- **仅审计快照 `threads` 中的节点**（环内 `invalid` 邮件与诊断明细不参与），
+  按**快照原始先序**逐封输出 `original_parent_id` / `original_root_id`
+  （快照基线）、`current_parent_id` / `current_root_id`（当前归档）与 `status`；
+- `status` 依次判定：
+  1. **deleted**：当前已不存在（如保留期清理删除），`current_*` 为 `null`；
+  2. **id_reused**：同 ID 当前属于其它批次——原归档被清理删除后，同 ID 由更晚
+     的批次重新归档（当前行与快照时不是同一归档）；
+  3. **reparented**：来源一致（仍是快照时的同一归档）但父节点变化（人工纠偏、
+     补链、清理压缩等）；
+  4. **root_changed**：父节点未变、仅所在树的根变化（祖先被纠偏或清理压缩）；
+  5. **unchanged**：父节点与根均与快照一致；
+- 快照树中的**历史祖先**（由更早批次归档、被本批树引用）以来源批次为准，
+  未重归档即视为来源一致，不会误判为 `id_reused`；
+- `summary` 返回 `total` 与各状态计数。
+
+服务监听 **8000** 端口：
+
+```bash
+curl http://localhost:8000/batches/<batch_id>/drift
+```
+
+```jsonc
+{
+  "batch_id": "…",
+  "submitted_at": "2026-09-18T08:00:00+00:00",   // 快照基线时刻（批次归档时间）
+  "results": [                 // 按快照原始先序逐封输出
+    {"message_id": "A", "original_parent_id": null, "original_root_id": "A",
+     "current_parent_id": "Q", "current_root_id": "P", "status": "reparented"},
+    {"message_id": "C", "original_parent_id": "A", "original_root_id": "A",
+     "current_parent_id": "A", "current_root_id": "P", "status": "root_changed"},
+    {"message_id": "D", "original_parent_id": "C", "original_root_id": "A",
+     "current_parent_id": null, "current_root_id": null, "status": "deleted"}
+  ],
+  "summary": {"total": 3, "deleted": 1, "id_reused": 0,
+              "reparented": 1, "root_changed": 1, "unchanged": 0}
 }
 ```
 
